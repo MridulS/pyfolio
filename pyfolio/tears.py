@@ -344,7 +344,7 @@ def create_interesting_times_tear_sheet(
 
 @plotting_context
 def create_bayesian_tear_sheet(returns, benchmark_rets, live_start_date,
-                               return_fig=False):
+                               return_fig=False, nprocs=-1):
     """
     Generate a number of Bayesian distributions and a Bayesian
     cone plot of returns.
@@ -375,10 +375,36 @@ def create_bayesian_tear_sheet(returns, benchmark_rets, live_start_date,
     ax_sharpe = plt.subplot(gs[row, 0])
     ax_vol = plt.subplot(gs[row, 1])
 
+    # Run models
     df_train = returns.loc[returns.index < live_start_date]
     df_test = returns.loc[returns.index >= live_start_date]
+    benchmark_rets = benchmark_rets.loc[df_train.index]
+
+    if (nprocs is not None) or (nprocs != 1):
+        import multiprocessing
+        jobs = []
+        t_model = multiprocessing.Process(target=bayesian.run_model,
+                                          args=('t', df_train),
+                                          kwargs=dict(returns_test=df_test,
+                                                      samples=2000))
+        t_model.start()
+        ab_model = multiprocessing.Process(target=bayesian.run_model,
+                                           args=('alpha_beta', df_train),
+                                           kwargs=dict(bmark=benchmark_rets,
+                                                       samples=2000))
+        ab_model.start()
+
+        # join
+        t_model.join()
+        ab_model.join()
+
+
+
+
     trace_t = bayesian.run_model('t', df_train, returns_test=df_test,
                                  samples=2000)
+    trace_alpha_beta = bayesian.run_model('alpha_beta', df_train,
+                                          bmark=benchmark_rets, samples=2000)
 
     sns.distplot(trace_t['sharpe'][100:], ax=ax_sharpe)
     # ax_sharpe.set_title('Bayesian T-Sharpe Ratio')
@@ -388,10 +414,6 @@ def create_bayesian_tear_sheet(returns, benchmark_rets, live_start_date,
     # ax_vol.set_title('Annual Volatility')
     ax_vol.set_xlabel('Annual Volatility')
     ax_vol.set_ylabel('Belief')
-
-    benchmark_rets = benchmark_rets.loc[df_train.index]
-    trace_alpha_beta = bayesian.run_model('alpha_beta', df_train,
-                                          bmark=benchmark_rets, samples=2000)
 
     row += 1
     ax_alpha = plt.subplot(gs[row, 0])
