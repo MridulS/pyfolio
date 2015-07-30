@@ -21,13 +21,197 @@ from scipy import stats
 import seaborn as sns
 
 import matplotlib.pyplot as plt
+from theano import shared
 
 import pymc3 as pm
+import theano.tensor as T
 
 from .timeseries import cum_returns
 
+class BayesianModel(object):
+    samples = 2000
+    def __init__(self, cache_model=True):
+        self.cached_model = None
+        self.shared_vars = {}
 
-def model_returns_t_alpha_beta(data, bmark, samples=2000):
+    def cache_model(self, **inputs):
+        self.shared_vars = self._create_shared_vars(**inputs)
+        self.cached_model = self.create_model(**self.shared_vars)
+
+    def create_model(self, **inputs):
+        raise NotImplementedError('This method has to be overwritten.')
+
+    def _create_shared_vars(self, **inputs):
+        shared_vars = {}
+        for name, data in inputs.items():
+            shared_vars[name] = shared(np.asarray(data), name=name)
+        return shared_vars
+
+    def run(self, **inputs):
+        if self.cached_model is None:
+            self.cache_model(**inputs)
+
+        for name, data in inputs.items():
+            self.shared_vars[name].set_value(data)
+
+        trace = self._inference()
+        return trace
+
+    def _inference(self):
+        with self.cached_model:
+            start = pm.find_MAP(fmin=sp.optimize.fmin_powell)
+            step = pm.NUTS(scaling=start)
+            trace = pm.sample(self.samples, step, start=start)
+
+        return trace
+
+
+class ReturnsNormal(BayesianModel):
+    def create_model(self, data=None):
+        with pm.Model() as model:
+            mu = pm.Normal('mean returns', mu=0, sd=.01, testval=T.mean(data))
+            sigma = pm.HalfCauchy('volatility', beta=1, testval=T.std(data))
+            returns = pm.Normal('returns', mu=mu, sd=sigma, observed=data)
+            pm.Deterministic(
+                'annual volatility',
+                returns.distribution.variance**.5 *
+                np.sqrt(252))
+            pm.Deterministic(
+                'sharpe',
+                returns.distribution.mean /
+                returns.distribution.variance**.5 *
+                np.sqrt(252))
+
+        return model
+
+
+returns_normal = ReturnsNormal()
+
+
+class ReturnsT(BayesianModel):
+    """Bayesian model assuming returns are Student-T distributed.
+
+    Compared with the normal model, this model assumes returns be
+    T-distributed and thus has a 3rd parameter (nu) that controls the
+    mass in the tails.
+
+    Parameters for run()
+    --------------------
+    returns : pandas.Series
+        Series of simple returns of an algorithm or stock.
+    samples : int (optional)
+        Number of posterior samples to draw.
+
+    Returns
+    -------
+    pymc3.sampling.BaseTrace object
+        A PyMC3 trace object that contains samples for each parameter
+        of the posterior.
+
+    """
+    def create_model(self, data=None):
+        with pm.Model() as model:
+            mu = pm.Normal('mean returns', mu=0, sd=.01, testval=T.mean(data))
+            sigma = pm.HalfCauchy('volatility', beta=1, testval=T.std(data))
+            nu = pm.Exponential('nu_minus_two', 1. / 10., testval=3.)
+
+            returns = pm.T('returns', nu=nu + 2, mu=mu, sd=sigma, observed=data)
+            pm.Deterministic('annual volatility',
+                             returns.distribution.variance**.5 * np.sqrt(252))
+
+            pm.Deterministic('sharpe', returns.distribution.mean /
+                             returns.distribution.variance**.5 *
+                             np.sqrt(252))
+
+        return model
+
+
+returns_t = ReturnsT()
+
+class BEST(BayesianModel):
+    """Bayesian Estimation Supersedes the T-Test
+
+    This model replicates the example used in:
+
+    Kruschke, John. (2012) Bayesian estimation supersedes the t
+    test. Journal of Experimental Psychology: General.
+
+    The original pymc2 implementation was written by Andrew Straw and
+    can be found here: https://github.com/strawlab/best
+
+    Ported to PyMC3 by Thomas Wiecki (c) 2015.
+    """
+    def create_model(self, y1=None, y2=None):
+        y = pm.concatenate((y1, y2))
+
+        mu_m = T.mean(y)
+        mu_p = 0.000001 * 1 / y.std()**2
+
+        sigma_low = y.std()/1000
+        sigma_high = y.std()*1000
+
+        with pm.Model() as model:
+            group1_mean = pm.Normal('group1_mean', mu=mu_m, tau=mu_p,
+                                    testval=T.mean(y1))
+            group2_mean = pm.Normal('group2_mean', mu=mu_m, tau=mu_p,
+                                    testval=T.mean(y2))
+            group1_std = pm.Uniform('group1_std', lower=sigma_low,
+                                    upper=sigma_high, testval=T.std(y1))
+            group2_std = pm.Uniform('group2_std', lower=sigma_low,
+                                    upper=sigma_high, testval=T.std(y2))
+            nu = pm.Exponential('nu_minus_one', 1/29.) + 1
+
+            pm.T('group1', nu=nu, mu=group1_mean,
+                 lam=group1_std**-2, observed=y1)
+            pm.T('group2', nu=nu, mu=group2_mean,
+                 lam=group2_std**-2, observed=y2)
+
+            diff_of_means = pm.Deterministic('difference of means',
+                                             group1_mean - group2_mean)
+            pm.Deterministic('difference of stds',
+                             group1_std - group2_std)
+            pm.Deterministic('effect size', diff_of_means /
+                             pm.sqrt((group1_std**2 +
+                                      group2_std**2) / 2))
+
+        return model
+
+    def analyze(self, trace=None, burn=200, ax1=None, ax2=None, ax3=None):
+        trace = trace[burn:]
+
+        if ax1 is None:
+            fig, (ax1, ax2) = plt.subplots(ncols=2, figsize=(16, 4))
+
+        sns.distplot(trace['group1_mean'], ax=ax1, label='backtest')
+        sns.distplot(trace['group2_mean'], ax=ax1, label='forward')
+        ax1.legend(loc=0)
+        # sns.distplot(trace['difference of means'], ax=ax2)
+        # ax2.axvline(0, linestyle='-', color='k')
+        # ax2.axvline(
+        #     stats.scoreatpercentile(trace['difference of means'], 2.5),
+        #     linestyle='--', color='b', label='2.5 and 97.5 percentiles')
+        # ax2.axvline(
+        #     stats.scoreatpercentile(trace['difference of means'], 97.5),
+        #     linestyle='--', color='b')
+        # ax2.legend(loc=0)
+
+        sns.distplot(trace['effect size'], ax=ax2)
+        ax2.axvline(0, linestyle='-', color='k')
+        ax2.axvline(
+            stats.scoreatpercentile(trace['effect size'], 2.5),
+            linestyle='--', color='b')
+        ax2.axvline(
+            stats.scoreatpercentile(trace['effect size'], 97.5),
+            linestyle='--', color='b')
+        ax1.set_xlabel('mean')
+        ax2.set_xlabel('difference of means')
+        ax2.set_xlabel('effect size')
+
+
+best = BEST()
+
+
+class ReturnsAlphaBeta(BayesianModel):
     """Run Bayesian alpha-beta-model with T distributed returns.
 
     This model estimates intercept (alpha) and slope (beta) of two
@@ -54,204 +238,32 @@ def model_returns_t_alpha_beta(data, bmark, samples=2000):
         A PyMC3 trace object that contains samples for each parameter
         of the posterior.
     """
+    def create_model(self, data=None, bmark=None):
+        with pm.Model() as model:
+            sigma = pm.HalfCauchy(
+                'sigma',
+                beta=1,
+                testval=data_no_missing.values.std())
+            nu = pm.Exponential('nu_minus_two', 1. / 10., testval=.3)
 
-    if len(data) != len(bmark):
-        # pad missing data
-        data = pd.Series(data, index=bmark.index)
+            # alpha and beta
+            beta_init, alpha_init = sp.stats.linregress(
+                bmark.loc[data_no_missing.index],
+                data_no_missing)[:2]
 
-    data_no_missing = data.dropna()
+            alpha_reg = pm.Normal('alpha', mu=0, sd=.1, testval=alpha_init)
+            beta_reg = pm.Normal('beta', mu=0, sd=1, testval=beta_init)
 
-    with pm.Model():
-        sigma = pm.HalfCauchy(
-            'sigma',
-            beta=1,
-            testval=data_no_missing.values.std())
-        nu = pm.Exponential('nu_minus_two', 1. / 10., testval=.3)
+            pm.T('returns',
+                 nu=nu + 2,
+                 mu=alpha_reg + beta_reg * bmark,
+                 sd=sigma,
+                 observed=data)
 
-        # alpha and beta
-        beta_init, alpha_init = sp.stats.linregress(
-            bmark.loc[data_no_missing.index],
-            data_no_missing)[:2]
-
-        alpha_reg = pm.Normal('alpha', mu=0, sd=.1, testval=alpha_init)
-        beta_reg = pm.Normal('beta', mu=0, sd=1, testval=beta_init)
-
-        pm.T('returns',
-             nu=nu + 2,
-             mu=alpha_reg + beta_reg * bmark,
-             sd=sigma,
-             observed=data)
-        start = pm.find_MAP(fmin=sp.optimize.fmin_powell)
-        step = pm.NUTS(scaling=start)
-        trace = pm.sample(samples, step, start=start)
-
-    return trace
+        return model
 
 
-def model_returns_normal(data, samples=500):
-    """Run Bayesian model assuming returns are Student-T distributed.
-
-    Compared with the normal model, this model assumes returns be
-    T-distributed and thus has a 3rd parameter (nu) that controls the
-    mass in the tails.
-
-    Parameters
-    ----------
-    returns : pandas.Series
-        Series of simple returns of an algorithm or stock.
-    samples : int (optional)
-        Number of posterior samples to draw.
-
-    Returns
-    -------
-    pymc3.sampling.BaseTrace object
-        A PyMC3 trace object that contains samples for each parameter
-        of the posterior.
-
-    """
-    with pm.Model():
-        mu = pm.Normal('mean returns', mu=0, sd=.01, testval=data.mean())
-        sigma = pm.HalfCauchy('volatility', beta=1, testval=data.std())
-        returns = pm.Normal('returns', mu=mu, sd=sigma, observed=data)
-        pm.Deterministic(
-            'annual volatility',
-            returns.distribution.variance**.5 *
-            np.sqrt(252))
-        pm.Deterministic(
-            'sharpe',
-            returns.distribution.mean /
-            returns.distribution.variance**.5 *
-            np.sqrt(252))
-
-        start = pm.find_MAP(fmin=sp.optimize.fmin_powell)
-        step = pm.NUTS(scaling=start)
-        trace = pm.sample(samples, step, start=start)
-    return trace
-
-
-def model_returns_t(data, samples=500):
-    """Run Bayesian model assuming returns are normally distributed.
-
-    Parameters
-    ----------
-    returns : pandas.Series
-        Series of simple returns of an algorithm or stock.
-    samples : int (optional)
-        Number of posterior samples to draw.
-
-    Returns
-    -------
-    pymc3.sampling.BaseTrace object
-        A PyMC3 trace object that contains samples for each parameter
-        of the posterior.
-
-    """
-
-    with pm.Model():
-        mu = pm.Normal('mean returns', mu=0, sd=.01, testval=data.mean())
-        sigma = pm.HalfCauchy('volatility', beta=1, testval=data.std())
-        nu = pm.Exponential('nu_minus_two', 1. / 10., testval=3.)
-
-        returns = pm.T('returns', nu=nu + 2, mu=mu, sd=sigma, observed=data)
-        pm.Deterministic('annual volatility',
-                         returns.distribution.variance**.5 * np.sqrt(252))
-
-        pm.Deterministic('sharpe', returns.distribution.mean /
-                         returns.distribution.variance**.5 *
-                         np.sqrt(252))
-
-        start = pm.find_MAP(fmin=sp.optimize.fmin_powell)
-        step = pm.NUTS(scaling=start)
-        trace = pm.sample(samples, step, start=start)
-    return trace
-
-
-def model_best(y1, y2, samples=1000):
-    """Bayesian Estimation Supersedes the T-Test
-
-    This model replicates the example used in:
-
-    Kruschke, John. (2012) Bayesian estimation supersedes the t
-    test. Journal of Experimental Psychology: General.
-
-    The original pymc2 implementation was written by Andrew Straw and
-    can be found here: https://github.com/strawlab/best
-
-    Ported to PyMC3 by Thomas Wiecki (c) 2015.
-    """
-
-    y = np.concatenate((y1, y2))
-
-    mu_m = np.mean(y)
-    mu_p = 0.000001 * 1 / np.std(y)**2
-
-    sigma_low = np.std(y)/1000
-    sigma_high = np.std(y)*1000
-    with pm.Model():
-        group1_mean = pm.Normal('group1_mean', mu=mu_m, tau=mu_p,
-                                testval=y1.mean())
-        group2_mean = pm.Normal('group2_mean', mu=mu_m, tau=mu_p,
-                                testval=y2.mean())
-        group1_std = pm.Uniform('group1_std', lower=sigma_low,
-                                upper=sigma_high, testval=y1.std())
-        group2_std = pm.Uniform('group2_std', lower=sigma_low,
-                                upper=sigma_high, testval=y2.std())
-        nu = pm.Exponential('nu_minus_one', 1/29.) + 1
-
-        pm.T('group1', nu=nu, mu=group1_mean,
-             lam=group1_std**-2, observed=y1)
-        pm.T('group2', nu=nu, mu=group2_mean,
-             lam=group2_std**-2, observed=y2)
-
-        diff_of_means = pm.Deterministic('difference of means',
-                                         group1_mean - group2_mean)
-        pm.Deterministic('difference of stds',
-                         group1_std - group2_std)
-        pm.Deterministic('effect size', diff_of_means /
-                         pm.sqrt((group1_std**2 +
-                                  group2_std**2) / 2))
-
-        step = pm.NUTS()
-
-        trace = pm.sample(samples, step)
-    return trace
-
-
-def plot_best(trace=None, data_train=None, data_test=None,
-              samples=1000, burn=200):
-    if trace is None:
-        if (data_train is not None) or (data_test is not None):
-            raise ValueError('Either pass trace or data_train and data_test')
-        trace = model_best(data_train, data_test, samples=samples)
-
-    trace = trace[burn:]
-
-    fig, (ax1, ax2, ax3) = plt.subplots(ncols=3, figsize=(16, 4))
-    sns.distplot(trace['group1_mean'], ax=ax1, label='backtest')
-    sns.distplot(trace['group2_mean'], ax=ax1, label='forward')
-    ax1.legend(loc=0)
-    sns.distplot(trace['difference of means'], ax=ax2)
-    ax2.axvline(0, linestyle='-', color='k')
-    ax2.axvline(
-        stats.scoreatpercentile(trace['difference of means'], 2.5),
-        linestyle='--', color='b', label='2.5 and 97.5 percentiles')
-    ax2.axvline(
-        stats.scoreatpercentile(trace['difference of means'], 97.5),
-        linestyle='--', color='b')
-    ax2.legend(loc=0)
-
-    sns.distplot(trace['effect size'], ax=ax3)
-    ax3.axvline(0, linestyle='-', color='k')
-    ax3.axvline(
-        stats.scoreatpercentile(trace['effect size'], 2.5),
-        linestyle='--', color='b')
-    ax3.axvline(
-        stats.scoreatpercentile(trace['effect size'], 97.5),
-        linestyle='--', color='b')
-    ax1.set_xlabel('mean')
-    ax2.set_xlabel('difference of means')
-    ax3.set_xlabel('effect size')
-
+returns_alpha_beta = ReturnsAlphaBeta()
 
 def compute_bayes_cone(preds, starting_value=1.):
     """Compute 5, 25, 75 and 95 percentiles of cumulative returns, used
@@ -380,13 +392,13 @@ def run_model(model, returns_train, returns_test=None,
         rets = returns_train
 
     if model == 'alpha_beta':
-        trace = model_returns_t_alpha_beta(returns_train, bmark, samples)
+        trace = returns_alpha_beta.run(data=returns_train, bmark=bmark)
     elif model == 't':
-        trace = model_returns_t(rets, samples)
+        trace = returns_t.run(data=rets)
     elif model == 'normal':
-        trace = model_returns_normal(rets, samples)
+        trace = returns_normal.run(data=rets)
     elif model == 'best':
-        trace = model_best(returns_train, returns_test, samples=samples)
+        trace = best.run(y1=returns_train, y2=returns_test)
     else:
         raise NotImplementedError(
             'Model {} not found.'

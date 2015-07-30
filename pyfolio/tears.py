@@ -369,7 +369,7 @@ def create_bayesian_tear_sheet(returns, benchmark_rets, live_start_date,
     """
 
     fig = plt.figure(figsize=(14, 10 * 2))
-    gs = gridspec.GridSpec(4, 2, wspace=0.3, hspace=0.3)
+    gs = gridspec.GridSpec(5, 3, wspace=0.3, hspace=0.3)
 
     row = 0
     ax_sharpe = plt.subplot(gs[row, 0])
@@ -380,31 +380,13 @@ def create_bayesian_tear_sheet(returns, benchmark_rets, live_start_date,
     df_test = returns.loc[returns.index >= live_start_date]
     benchmark_rets = benchmark_rets.loc[df_train.index]
 
-    if (nprocs is not None) or (nprocs != 1):
-        import multiprocessing
-        jobs = []
-        t_model = multiprocessing.Process(target=bayesian.run_model,
-                                          args=('t', df_train),
-                                          kwargs=dict(returns_test=df_test,
-                                                      samples=2000))
-        t_model.start()
-        ab_model = multiprocessing.Process(target=bayesian.run_model,
-                                           args=('alpha_beta', df_train),
-                                           kwargs=dict(bmark=benchmark_rets,
-                                                       samples=2000))
-        ab_model.start()
 
-        # join
-        t_model.join()
-        ab_model.join()
-
-
-
-
-    trace_t = bayesian.run_model('t', df_train, returns_test=df_test,
-                                 samples=2000)
+    trace_t = bayesian.run_model('t', df_train, returns_test=df_test)
     trace_alpha_beta = bayesian.run_model('alpha_beta', df_train,
-                                          bmark=benchmark_rets, samples=2000)
+                                          bmark=benchmark_rets)
+    trace_best = bayesian.run_model('best', df_train,
+                                    returns_test=df_test,
+                                    ax1=ax_best_mean, ax2=ax_best_ez)
 
     sns.distplot(trace_t['sharpe'][100:], ax=ax_sharpe)
     # ax_sharpe.set_title('Bayesian T-Sharpe Ratio')
@@ -463,6 +445,11 @@ def create_bayesian_tear_sheet(returns, benchmark_rets, live_start_date,
     bayesian.plot_bayes_cone(df_train, df_test,
                              trace=trace_t,
                              ax=ax_cone)
+
+    row += 1
+    ax_best_mean = plt.subplot(gs[row, 0])
+    ax_best_ez = plt.subplot(gs[row, 1])
+    bayesian.best.analyze(trace, burn=200, )
 
     if return_fig:
         return fig
